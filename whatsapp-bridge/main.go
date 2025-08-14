@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
+    "io"
 	"fmt"
 	"math"
 	"math/rand"
@@ -39,6 +40,77 @@ type Message struct {
 	IsFromMe  bool
 	MediaType string
 	Filename  string
+}
+
+// Outgoing webhook configuration
+var outgoingURL string
+var outgoingHeaderName string
+var outgoingKey string
+
+func getenvDefault(key, def string) string {
+    if v := os.Getenv(key); v != "" {
+        return v
+    }
+    return def
+}
+
+// Attempt to read a single KEY=value from a .env file
+func loadEnvKeyFromFile(path, key string) string {
+    data, err := os.ReadFile(path)
+    if err != nil {
+        return ""
+    }
+    lines := strings.Split(string(data), "\n")
+    prefix := key + "="
+    for _, line := range lines {
+        line = strings.TrimSpace(line)
+        if line == "" || strings.HasPrefix(line, "#") {
+            continue
+        }
+        if strings.HasPrefix(line, prefix) {
+            val := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+            // Trim optional surrounding quotes
+            val = strings.TrimPrefix(val, "\"")
+            val = strings.TrimSuffix(val, "\"")
+            return val
+        }
+    }
+    return ""
+}
+
+func postOutgoingWebhookAsync(payload map[string]interface{}) {
+    if outgoingURL == "" {
+        return
+    }
+    body, err := json.Marshal(payload)
+    if err != nil {
+        fmt.Printf("Failed to marshal webhook payload: %v\n", err)
+        return
+    }
+    req, err := http.NewRequest(http.MethodPost, outgoingURL, bytes.NewReader(body))
+    if err != nil {
+        fmt.Printf("Failed to create webhook request: %v\n", err)
+        return
+    }
+    req.Header.Set("Content-Type", "application/json")
+    if outgoingKey != "" {
+        headerName := outgoingHeaderName
+        if headerName == "" {
+            headerName = "X-Webhook-Api-Key"
+        }
+        req.Header.Set(headerName, outgoingKey)
+    }
+
+    go func() {
+        client := &http.Client{Timeout: 5 * time.Second}
+        resp, err := client.Do(req)
+        if err != nil {
+            fmt.Printf("Webhook delivery error: %v\n", err)
+            return
+        }
+        io.Copy(io.Discard, resp.Body)
+        resp.Body.Close()
+    }()
 }
 
 // Database handler for storing message history
@@ -466,7 +538,37 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
-		}
+        }
+
+        // Prepare payload for external /store-message endpoint
+        msgDirection := "inbound"
+        if msg.Info.IsFromMe {
+            msgDirection = "outbound"
+        }
+        // Determine phone number: for inbound, use sender; for outbound direct chats, use chat user; groups -> empty
+        phoneNumber := sender
+        if msg.Info.IsFromMe {
+            if msg.Info.Chat.Server == "s.whatsapp.net" {
+                phoneNumber = msg.Info.Chat.User
+            } else {
+                phoneNumber = ""
+            }
+        }
+
+        payload := map[string]interface{}{
+            "phone_number": phoneNumber,
+            "message":      content,
+            "direction":    msgDirection,
+            "message_id":   msg.Info.ID,
+            "request_id":   fmt.Sprintf("req-%d-%d", time.Now().UnixNano(), rand.Int63()),
+            "metadata": map[string]interface{}{
+                "chat_jid":  chatJID,
+                "timestamp": msg.Info.Timestamp.Format(time.RFC3339),
+                "media_type": mediaType,
+                "filename":  filename,
+            },
+        }
+        postOutgoingWebhookAsync(payload)
 	}
 }
 
@@ -791,7 +893,25 @@ func main() {
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
 
-	// Create database connection for storing session data
+    // Configure outgoing webhook (optional)
+    // Prefer environment variables; if missing, attempt to read key from ../whatsapp-mcp-server/.env
+    outgoingURL = os.Getenv("OUTGOING_WEBHOOK_URL")
+    if outgoingURL == "" {
+        // Try to read from python server .env
+        outgoingURL = loadEnvKeyFromFile("../whatsapp-mcp-server/.env", "OUTGOING_WEBHOOK_URL")
+    }
+    outgoingHeaderName = getenvDefault("OUTGOING_WEBHOOK_SECRET_HEADER", "X-API-Key")
+    // Prefer OUTGOING_WEBHOOK_SECRET; fallback to WEBHOOK_API_KEY; if still empty, read from .env
+    outgoingKey = os.Getenv("OUTGOING_WEBHOOK_SECRET")
+    if outgoingKey == "" {
+        outgoingKey = os.Getenv("WEBHOOK_API_KEY")
+        if outgoingKey == "" {
+            // Try to read from python server .env
+            outgoingKey = loadEnvKeyFromFile("../whatsapp-mcp-server/.env", "WEBHOOK_API_KEY")
+        }
+    }
+
+    // Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
