@@ -1,11 +1,13 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Literal
 from dataclasses import asdict, is_dataclass
 import os
+import json
 
-from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi import FastAPI, Query, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import httpx
 
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
@@ -27,6 +29,17 @@ app = FastAPI(title="whatsapp-mcp-fastapi", version="0.1.0")
 # Load environment variables from local .env
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 WEBHOOK_API_KEY = os.environ.get("WEBHOOK_API_KEY")
+OUTGOING_WEBHOOK_URL = os.environ.get("OUTGOING_WEBHOOK_URL")
+OUTGOING_WEBHOOK_HEADERS = os.environ.get("OUTGOING_WEBHOOK_HEADERS")  # JSON string of default headers
+OUTGOING_WEBHOOK_SECRET_HEADER = os.environ.get("OUTGOING_WEBHOOK_SECRET_HEADER", "X-Webhook-Secret")
+OUTGOING_WEBHOOK_SECRET = os.environ.get("OUTGOING_WEBHOOK_SECRET")
+
+try:
+    DEFAULT_OUTGOING_HEADERS = json.loads(OUTGOING_WEBHOOK_HEADERS) if OUTGOING_WEBHOOK_HEADERS else {}
+    if not isinstance(DEFAULT_OUTGOING_HEADERS, dict):
+        DEFAULT_OUTGOING_HEADERS = {}
+except Exception:
+    DEFAULT_OUTGOING_HEADERS = {}
 
 
 # ---------- Security Middleware ----------
@@ -79,6 +92,16 @@ class SendMediaRequest(BaseModel):
 class DownloadMediaRequest(BaseModel):
     message_id: str
     chat_jid: str
+
+
+class WebhookTriggerRequest(BaseModel):
+    target_url: Optional[str] = None
+    method: Literal["POST", "GET"] = "POST"
+    payload: Optional[Dict[str, Any]] = None
+    headers: Optional[Dict[str, str]] = None
+    query: Optional[Dict[str, str]] = None
+    async_mode: bool = True
+    timeout_seconds: float = 10.0
 
 
 # ---------- Endpoints (replicating tools) ----------
@@ -197,6 +220,78 @@ def download_media(payload: DownloadMediaRequest) -> Dict[str, Any]:
     if file_path:
         return {"success": True, "message": "Media downloaded successfully", "file_path": file_path}
     return {"success": False, "message": "Failed to download media"}
+
+
+def _build_outgoing_headers(override_headers: Optional[Dict[str, str]]) -> Dict[str, str]:
+    headers: Dict[str, str] = dict(DEFAULT_OUTGOING_HEADERS)
+    if OUTGOING_WEBHOOK_SECRET:
+        headers[OUTGOING_WEBHOOK_SECRET_HEADER] = OUTGOING_WEBHOOK_SECRET
+    if override_headers:
+        headers.update({k: v for k, v in override_headers.items() if isinstance(k, str) and isinstance(v, str)})
+    # Ensure JSON content-type by default for POST
+    if "Content-Type" not in headers:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
+def _send_webhook_sync(
+    url: str,
+    method: str,
+    headers: Dict[str, str],
+    payload: Optional[Dict[str, Any]],
+    query: Optional[Dict[str, str]],
+    timeout_seconds: float,
+) -> None:
+    with httpx.Client(timeout=timeout_seconds, follow_redirects=True) as client:
+        if method == "GET":
+            client.get(url, params=query, headers=headers)
+        else:
+            client.post(url, params=query, headers=headers, json=(payload or {}))
+
+
+@app.post("/webhook/trigger")
+async def webhook_trigger(payload: WebhookTriggerRequest, background_tasks: BackgroundTasks) -> Dict[str, Any]:
+    """Trigger a configurable outgoing webhook call.
+
+    - If `target_url` is omitted, uses `OUTGOING_WEBHOOK_URL` from env.
+    - Adds default headers from `OUTGOING_WEBHOOK_HEADERS` (JSON) and optional secret header.
+    - When `async_mode=true` (default), dispatches in background and returns immediately.
+    """
+    url = payload.target_url or OUTGOING_WEBHOOK_URL
+    if not url:
+        raise HTTPException(status_code=400, detail="No target_url provided and OUTGOING_WEBHOOK_URL not configured")
+
+    headers = _build_outgoing_headers(payload.headers)
+    method = payload.method.upper()
+
+    if payload.async_mode:
+        background_tasks.add_task(
+            _send_webhook_sync,
+            url,
+            method,
+            headers,
+            payload.payload,
+            payload.query,
+            payload.timeout_seconds,
+        )
+        return {"scheduled": True}
+
+    # Synchronous dispatch: await result and return status
+    try:
+        async with httpx.AsyncClient(timeout=payload.timeout_seconds, follow_redirects=True) as client:
+            if method == "GET":
+                resp = await client.get(url, params=payload.query, headers=headers)
+            else:
+                resp = await client.post(url, params=payload.query, headers=headers, json=(payload.payload or {}))
+        text_excerpt = (resp.text or "")[:1000]
+        return {
+            "scheduled": False,
+            "status_code": resp.status_code,
+            "ok": resp.is_success,
+            "response_excerpt": text_excerpt,
+        }
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Webhook request error: {str(e)}")
 
 
 # Local dev entrypoint (optional)
