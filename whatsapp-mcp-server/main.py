@@ -2,6 +2,8 @@ from typing import Any, Dict, List, Optional, Literal
 from dataclasses import asdict, is_dataclass
 import os
 import json
+from datetime import datetime
+from collections import deque
 
 from fastapi import FastAPI, Query, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
@@ -31,8 +33,10 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 WEBHOOK_API_KEY = os.environ.get("WEBHOOK_API_KEY")
 OUTGOING_WEBHOOK_URL = os.environ.get("OUTGOING_WEBHOOK_URL")
 OUTGOING_WEBHOOK_HEADERS = os.environ.get("OUTGOING_WEBHOOK_HEADERS")  # JSON string of default headers
-OUTGOING_WEBHOOK_SECRET_HEADER = os.environ.get("OUTGOING_WEBHOOK_SECRET_HEADER", "X-Webhook-Secret")
-OUTGOING_WEBHOOK_SECRET = os.environ.get("OUTGOING_WEBHOOK_SECRET")
+# Default outgoing header aligns with incoming protection
+OUTGOING_WEBHOOK_SECRET_HEADER = os.environ.get("OUTGOING_WEBHOOK_SECRET_HEADER", "X-Webhook-Api-Key")
+# Reuse WEBHOOK_API_KEY by default if a separate outgoing secret is not provided
+OUTGOING_WEBHOOK_SECRET = os.environ.get("OUTGOING_WEBHOOK_SECRET") or WEBHOOK_API_KEY
 
 try:
     DEFAULT_OUTGOING_HEADERS = json.loads(OUTGOING_WEBHOOK_HEADERS) if OUTGOING_WEBHOOK_HEADERS else {}
@@ -40,6 +44,9 @@ try:
         DEFAULT_OUTGOING_HEADERS = {}
 except Exception:
     DEFAULT_OUTGOING_HEADERS = {}
+
+# In-memory received events buffer (for quick inspection)
+RECEIVED_EVENTS: deque = deque(maxlen=200)
 
 
 # ---------- Security Middleware ----------
@@ -102,6 +109,10 @@ class WebhookTriggerRequest(BaseModel):
     query: Optional[Dict[str, str]] = None
     async_mode: bool = True
     timeout_seconds: float = 10.0
+
+class IngestResponse(BaseModel):
+    received: bool
+    stored_events: int
 
 
 # ---------- Endpoints (replicating tools) ----------
@@ -292,6 +303,30 @@ async def webhook_trigger(payload: WebhookTriggerRequest, background_tasks: Back
         }
     except httpx.RequestError as e:
         raise HTTPException(status_code=502, detail=f"Webhook request error: {str(e)}")
+
+
+@app.post("/webhook/ingest", response_model=IngestResponse)
+async def webhook_ingest(request: Request) -> IngestResponse:
+    """Receive webhook events (e.g., from the Go bridge) and store briefly in memory.
+
+    Requires the same `X-Webhook-Api-Key` header as other protected endpoints.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {"_raw": await request.body()}
+    RECEIVED_EVENTS.append({
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "headers": dict(request.headers),
+        "body": payload,
+    })
+    return IngestResponse(received=True, stored_events=len(RECEIVED_EVENTS))
+
+
+@app.get("/webhook/events")
+def list_ingested_events(limit: int = 20) -> Dict[str, Any]:
+    events = list(RECEIVED_EVENTS)[-max(0, min(limit, len(RECEIVED_EVENTS))):]
+    return {"events": events}
 
 
 # Local dev entrypoint (optional)
