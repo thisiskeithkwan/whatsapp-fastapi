@@ -882,6 +882,10 @@ func main() {
     // Configure outgoing webhook (optional)
     // Prefer environment variables; if missing, attempt to read key from ../whatsapp-mcp-server/.env
     outgoingURL = os.Getenv("OUTGOING_WEBHOOK_URL")
+    if outgoingURL == "" {
+        // Try to read from python server .env
+        outgoingURL = loadEnvKeyFromFile("../whatsapp-mcp-server/.env", "OUTGOING_WEBHOOK_URL")
+    }
     outgoingHeaderName = getenvDefault("OUTGOING_WEBHOOK_SECRET_HEADER", "X-Webhook-Api-Key")
     // Prefer OUTGOING_WEBHOOK_SECRET; fallback to WEBHOOK_API_KEY; if still empty, read from .env
     outgoingKey = os.Getenv("OUTGOING_WEBHOOK_SECRET")
