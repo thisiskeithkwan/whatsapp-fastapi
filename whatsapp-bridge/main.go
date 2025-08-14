@@ -540,16 +540,30 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
         }
 
-        // Trigger outgoing webhook with message details
+        // Prepare payload for external /store-message endpoint
+        msgDirection := "inbound"
+        if msg.Info.IsFromMe {
+            msgDirection = "outbound"
+        }
+        // Determine phone number: for inbound, use sender; for outbound direct chats, use chat user; groups -> empty
+        phoneNumber := sender
+        if msg.Info.IsFromMe {
+            if msg.Info.Chat.Server == "s.whatsapp.net" {
+                phoneNumber = msg.Info.Chat.User
+            } else {
+                phoneNumber = ""
+            }
+        }
+
         payload := map[string]interface{}{
-            "event": "whatsapp.message",
-            "message": map[string]interface{}{
-                "id":        msg.Info.ID,
+            "phone_number": phoneNumber,
+            "message":      content,
+            "direction":    msgDirection,
+            "message_id":   msg.Info.ID,
+            "request_id":   fmt.Sprintf("req-%d-%d", time.Now().UnixNano(), rand.Int63()),
+            "metadata": map[string]interface{}{
                 "chat_jid":  chatJID,
-                "sender":    sender,
-                "content":   content,
                 "timestamp": msg.Info.Timestamp.Format(time.RFC3339),
-                "is_from_me": msg.Info.IsFromMe,
                 "media_type": mediaType,
                 "filename":  filename,
             },
@@ -886,7 +900,7 @@ func main() {
         // Try to read from python server .env
         outgoingURL = loadEnvKeyFromFile("../whatsapp-mcp-server/.env", "OUTGOING_WEBHOOK_URL")
     }
-    outgoingHeaderName = getenvDefault("OUTGOING_WEBHOOK_SECRET_HEADER", "X-Webhook-Api-Key")
+    outgoingHeaderName = getenvDefault("OUTGOING_WEBHOOK_SECRET_HEADER", "X-API-Key")
     // Prefer OUTGOING_WEBHOOK_SECRET; fallback to WEBHOOK_API_KEY; if still empty, read from .env
     outgoingKey = os.Getenv("OUTGOING_WEBHOOK_SECRET")
     if outgoingKey == "" {
