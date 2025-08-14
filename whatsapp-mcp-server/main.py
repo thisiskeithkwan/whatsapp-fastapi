@@ -1,5 +1,12 @@
-from typing import List, Dict, Any, Optional
-from mcp.server.fastmcp import FastMCP
+from typing import Any, Dict, List, Optional
+from dataclasses import asdict, is_dataclass
+import os
+
+from fastapi import FastAPI, Query, Request, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
 from whatsapp import (
     search_contacts as whatsapp_search_contacts,
     list_messages as whatsapp_list_messages,
@@ -11,24 +18,82 @@ from whatsapp import (
     get_message_context as whatsapp_get_message_context,
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
-    send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    send_audio_message as whatsapp_send_audio_message,
+    download_media as whatsapp_download_media,
 )
 
-# Initialize FastMCP server
-mcp = FastMCP("whatsapp")
+app = FastAPI(title="whatsapp-mcp-fastapi", version="0.1.0")
 
-@mcp.tool()
-def search_contacts(query: str) -> List[Dict[str, Any]]:
-    """Search WhatsApp contacts by name or phone number.
-    
-    Args:
-        query: Search term to match against contact names or phone numbers
-    """
+# Load environment variables from local .env
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+WEBHOOK_API_KEY = os.environ.get("WEBHOOK_API_KEY")
+
+
+# ---------- Security Middleware ----------
+
+EXEMPT_PATHS = {"/docs", "/redoc", "/openapi.json", "/health"}
+
+@app.middleware("http")
+async def require_webhook_api_key(request: Request, call_next):
+    # Skip protection for docs and health
+    if request.url.path in EXEMPT_PATHS:
+        return await call_next(request)
+
+    if not WEBHOOK_API_KEY:
+        # If not configured, block by default to avoid accidental exposure
+        return JSONResponse(status_code=500, content={"detail": "Server misconfiguration: WEBHOOK_API_KEY not set"})
+
+    header_value = request.headers.get("x-webhook-api-key")
+    if header_value is None:
+        return JSONResponse(status_code=401, content={"detail": "Missing X-Webhook-Api-Key header"})
+    if header_value != WEBHOOK_API_KEY:
+        return JSONResponse(status_code=403, content={"detail": "Invalid webhook API key"})
+
+    return await call_next(request)
+
+
+# ---------- Helpers ----------
+
+def dataclass_to_dict(obj: Any) -> Any:
+    if is_dataclass(obj):
+        return asdict(obj)
+    if isinstance(obj, list):
+        return [dataclass_to_dict(item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: dataclass_to_dict(value) for key, value in obj.items()}
+    return obj
+
+
+# ---------- Request Models ----------
+
+class SendTextRequest(BaseModel):
+    recipient: str
+    message: str
+
+
+class SendMediaRequest(BaseModel):
+    recipient: str
+    media_path: str
+
+
+class DownloadMediaRequest(BaseModel):
+    message_id: str
+    chat_jid: str
+
+
+# ---------- Endpoints (replicating tools) ----------
+
+@app.get("/health")
+def health() -> Dict[str, str]:
+    return {"status": "ok"}
+
+@app.get("/contacts/search")
+def search_contacts(query: str = Query(..., description="Search name or phone number")) -> List[Dict[str, Any]]:
     contacts = whatsapp_search_contacts(query)
-    return contacts
+    return dataclass_to_dict(contacts)
 
-@mcp.tool()
+
+@app.get("/messages")
 def list_messages(
     after: Optional[str] = None,
     before: Optional[str] = None,
@@ -39,23 +104,10 @@ def list_messages(
     page: int = 0,
     include_context: bool = True,
     context_before: int = 1,
-    context_after: int = 1
-) -> List[Dict[str, Any]]:
-    """Get WhatsApp messages matching specified criteria with optional context.
-    
-    Args:
-        after: Optional ISO-8601 formatted string to only return messages after this date
-        before: Optional ISO-8601 formatted string to only return messages before this date
-        sender_phone_number: Optional phone number to filter messages by sender
-        chat_jid: Optional chat JID to filter messages by chat
-        query: Optional search term to filter messages by content
-        limit: Maximum number of messages to return (default 20)
-        page: Page number for pagination (default 0)
-        include_context: Whether to include messages before and after matches (default True)
-        context_before: Number of messages to include before each match (default 1)
-        context_after: Number of messages to include after each match (default 1)
-    """
-    messages = whatsapp_list_messages(
+    context_after: int = 1,
+) -> Dict[str, Any]:
+    # whatsapp_list_messages returns a formatted string when include_context is True
+    messages_output = whatsapp_list_messages(
         after=after,
         before=before,
         sender_phone_number=sender_phone_number,
@@ -65,187 +117,87 @@ def list_messages(
         page=page,
         include_context=include_context,
         context_before=context_before,
-        context_after=context_after
+        context_after=context_after,
     )
-    return messages
+    if isinstance(messages_output, str):
+        return {"output": messages_output}
+    # Fallback for potential list of dataclasses
+    return {"messages": dataclass_to_dict(messages_output)}
 
-@mcp.tool()
+
+@app.get("/chats")
 def list_chats(
     query: Optional[str] = None,
     limit: int = 20,
     page: int = 0,
     include_last_message: bool = True,
-    sort_by: str = "last_active"
+    sort_by: str = "last_active",
 ) -> List[Dict[str, Any]]:
-    """Get WhatsApp chats matching specified criteria.
-    
-    Args:
-        query: Optional search term to filter chats by name or JID
-        limit: Maximum number of chats to return (default 20)
-        page: Page number for pagination (default 0)
-        include_last_message: Whether to include the last message in each chat (default True)
-        sort_by: Field to sort results by, either "last_active" or "name" (default "last_active")
-    """
     chats = whatsapp_list_chats(
         query=query,
         limit=limit,
         page=page,
         include_last_message=include_last_message,
-        sort_by=sort_by
+        sort_by=sort_by,
     )
-    return chats
+    return dataclass_to_dict(chats)
 
-@mcp.tool()
-def get_chat(chat_jid: str, include_last_message: bool = True) -> Dict[str, Any]:
-    """Get WhatsApp chat metadata by JID.
-    
-    Args:
-        chat_jid: The JID of the chat to retrieve
-        include_last_message: Whether to include the last message (default True)
-    """
+
+@app.get("/chats/{chat_jid}")
+def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Dict[str, Any]]:
     chat = whatsapp_get_chat(chat_jid, include_last_message)
-    return chat
+    return dataclass_to_dict(chat)
 
-@mcp.tool()
-def get_direct_chat_by_contact(sender_phone_number: str) -> Dict[str, Any]:
-    """Get WhatsApp chat metadata by sender phone number.
-    
-    Args:
-        sender_phone_number: The phone number to search for
-    """
+
+@app.get("/chats/direct-by-contact")
+def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Dict[str, Any]]:
     chat = whatsapp_get_direct_chat_by_contact(sender_phone_number)
-    return chat
+    return dataclass_to_dict(chat)
 
-@mcp.tool()
+
+@app.get("/contacts/{jid}/chats")
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Dict[str, Any]]:
-    """Get all WhatsApp chats involving the contact.
-    
-    Args:
-        jid: The contact's JID to search for
-        limit: Maximum number of chats to return (default 20)
-        page: Page number for pagination (default 0)
-    """
     chats = whatsapp_get_contact_chats(jid, limit, page)
-    return chats
+    return dataclass_to_dict(chats)
 
-@mcp.tool()
-def get_last_interaction(jid: str) -> str:
-    """Get most recent WhatsApp message involving the contact.
-    
-    Args:
-        jid: The JID of the contact to search for
-    """
+
+@app.get("/contacts/{jid}/last-interaction")
+def get_last_interaction(jid: str) -> Dict[str, Optional[str]]:
     message = whatsapp_get_last_interaction(jid)
-    return message
+    return {"output": message}
 
-@mcp.tool()
-def get_message_context(
-    message_id: str,
-    before: int = 5,
-    after: int = 5
-) -> Dict[str, Any]:
-    """Get context around a specific WhatsApp message.
-    
-    Args:
-        message_id: The ID of the message to get context for
-        before: Number of messages to include before the target message (default 5)
-        after: Number of messages to include after the target message (default 5)
-    """
+
+@app.get("/messages/{message_id}/context")
+def get_message_context(message_id: str, before: int = 5, after: int = 5) -> Dict[str, Any]:
     context = whatsapp_get_message_context(message_id, before, after)
-    return context
+    return dataclass_to_dict(context)
 
-@mcp.tool()
-def send_message(
-    recipient: str,
-    message: str
-) -> Dict[str, Any]:
-    """Send a WhatsApp message to a person or group. For group chats use the JID.
 
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        message: The message text to send
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    # Validate input
-    if not recipient:
-        return {
-            "success": False,
-            "message": "Recipient must be provided"
-        }
-    
-    # Call the whatsapp_send_message function with the unified recipient parameter
-    success, status_message = whatsapp_send_message(recipient, message)
-    return {
-        "success": success,
-        "message": status_message
-    }
+@app.post("/messages/send-text")
+def send_message(payload: SendTextRequest) -> Dict[str, Any]:
+    success, status_message = whatsapp_send_message(payload.recipient, payload.message)
+    return {"success": success, "message": status_message}
 
-@mcp.tool()
-def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the media file to send (image, video, document)
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
 
-@mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
-    """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
-    Args:
-        recipient: The recipient - either a phone number with country code but no + or other symbols,
-                 or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
-    Returns:
-        A dictionary containing success status and a status message
-    """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
-    return {
-        "success": success,
-        "message": status_message
-    }
+@app.post("/messages/send-file")
+def send_file(payload: SendMediaRequest) -> Dict[str, Any]:
+    success, status_message = whatsapp_send_file(payload.recipient, payload.media_path)
+    return {"success": success, "message": status_message}
 
-@mcp.tool()
-def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
-    """Download media from a WhatsApp message and get the local file path.
-    
-    Args:
-        message_id: The ID of the message containing the media
-        chat_jid: The JID of the chat containing the message
-    
-    Returns:
-        A dictionary containing success status, a status message, and the file path if successful
-    """
-    file_path = whatsapp_download_media(message_id, chat_jid)
-    
+
+@app.post("/messages/send-audio")
+def send_audio_message(payload: SendMediaRequest) -> Dict[str, Any]:
+    success, status_message = whatsapp_send_audio_message(payload.recipient, payload.media_path)
+    return {"success": success, "message": status_message}
+
+
+@app.post("/media/download")
+def download_media(payload: DownloadMediaRequest) -> Dict[str, Any]:
+    file_path = whatsapp_download_media(payload.message_id, payload.chat_jid)
     if file_path:
-        return {
-            "success": True,
-            "message": "Media downloaded successfully",
-            "file_path": file_path
-        }
-    else:
-        return {
-            "success": False,
-            "message": "Failed to download media"
-        }
+        return {"success": True, "message": "Media downloaded successfully", "file_path": file_path}
+    return {"success": False, "message": "Failed to download media"}
 
-if __name__ == "__main__":
-    # Initialize and run the server
-    mcp.run(transport='stdio')
+
+# Local dev entrypoint (optional)
+# Run with: uvicorn fastapi_app:app --reload --port 8000
