@@ -1,13 +1,18 @@
 # Multi-service container for Railway: Go WhatsApp bridge + FastAPI (uv)
 
 # --- Build Go bridge ---
-FROM golang:1.22-bullseye AS go-builder
+FROM golang:1.23-bullseye AS go-builder
+ENV GOTOOLCHAIN=auto
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       build-essential ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /src/whatsapp-bridge
 COPY whatsapp-bridge/go.mod whatsapp-bridge/go.sum ./
 RUN go mod download
 COPY whatsapp-bridge/ .
-# Build binary (CGO needed for sqlite3)
-RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o /out/whatsapp-bridge
+# Build binary (CGO needed for sqlite3). Compile for the container's native arch.
+RUN CGO_ENABLED=1 go build -o /out/whatsapp-bridge
 
 # --- Final runtime with uv preinstalled ---
 FROM ghcr.io/astral-sh/uv:python3.11-bookworm
