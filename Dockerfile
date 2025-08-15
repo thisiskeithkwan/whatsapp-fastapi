@@ -13,6 +13,12 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o /out/whatsapp-bridge
 FROM ghcr.io/astral-sh/uv:python3.11-bookworm
 WORKDIR /app
 
+# System deps for audio conversion and SSL
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install Python deps via uv (respect lock)
 COPY whatsapp-mcp-server/pyproject.toml whatsapp-mcp-server/uv.lock ./whatsapp-mcp-server/
 RUN cd whatsapp-mcp-server && uv sync --frozen --no-dev
